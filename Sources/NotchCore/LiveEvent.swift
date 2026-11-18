@@ -103,11 +103,10 @@ public enum HookAdapter {
         } else {
             return nil
         }
-        // Ignore subagent-specific envelopes rather than counting a parent twice.
-        if let agent = json["agent_id"] as? String, !agent.isEmpty { return nil }
-        if let parent = json["parent_session_id"] as? String, !parent.isEmpty { return nil }
-        if let agent = json["agentId"] as? String, !agent.isEmpty { return nil }
-        if let parent = json["parentConversationId"] as? String, !parent.isEmpty { return nil }
+        // Ignore subagent, swarm-worker, battle-fork, and background child envelopes so only main agents appear.
+        if isSubagentOrWorkerPayload(json, source: source, sessionID: sessionID, eventName: name) {
+            return nil
+        }
 
         let action: EventAction
         switch name {
@@ -196,6 +195,51 @@ public enum HookAdapter {
         return event.valid ? event : nil
     }
 
+    private static func isSubagentOrWorkerPayload(_ json: [String: Any], source: Source,
+                                                  sessionID: String, eventName: String) -> Bool {
+        let scopes: [[String: Any]] = if let common = json["common"] as? [String: Any] {
+            [json, common]
+        } else {
+            [json]
+        }
+        let childIDKeys = [
+            "agent_id", "agentId",
+            "parent_agent_id", "parentAgentId",
+            "parent_session_id", "parentSessionId",
+            "caller_session_id", "callerSessionId",
+            "parent_thread_id", "parentThreadId",
+            "parent_conversation_id", "parentConversationId",
+            "subagent_kind", "subagentKind"
+        ]
+        for scope in scopes {
+            for key in childIDKeys {
+                if let value = scope[key] as? String, !value.isEmpty { return true }
+            }
+            if let rootID = (scope["rootConversationId"] as? String) ?? (scope["root_conversation_id"] as? String),
+               !rootID.isEmpty, rootID != sessionID {
+                return true
+            }
+            if (scope["isBattleMode"] as? Bool) == true || (scope["is_battle_mode"] as? Bool) == true {
+                return true
+            }
+            for contextKey in ["callerContext", "caller_context", "threadSource", "thread_source"] {
+                if let ctx = (scope[contextKey] as? String)?.lowercased(), !ctx.isEmpty,
+                   ctx.contains("subagent") || ctx.contains("swarm") || ctx.contains("worker") || ctx.contains("thread_spawn") {
+                    return true
+                }
+            }
+            // Antigravity swarm workers, monitors, and narrators run without human USER_INPUT steps,
+            // emitting an explicit empty lastUserInput string on execution hooks.
+            if source == .agy, eventName != "SessionStart" {
+                let rawInput = (scope["lastUserInput"] as? String) ?? (scope["last_user_input"] as? String)
+                if let rawInput, rawInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     private static func clean(_ string: String, fallback: String) -> String {
         let value = GitContext.sanitizeLabel(string, maxCount: 64)
         return value.isEmpty ? fallback : value
@@ -207,6 +251,7 @@ public struct LiveAttention: Sendable {
     public private(set) var queue = AttentionQueue()
     private var latest: [SessionKey: Double] = [:]
     private var lastAction: [SessionKey: EventAction] = [:]
+    private var ignoredChildSessions: Set<SessionKey> = []
 
     public init() {}
 
@@ -214,7 +259,11 @@ public struct LiveAttention: Sendable {
         if latest.count > 512, let oldest = latest.min(by: { $0.value < $1.value })?.key {
             latest.removeValue(forKey: oldest)
             lastAction.removeValue(forKey: oldest)
+            ignoredChildSessions.remove(oldest)
             queue.acknowledge(oldest)
+        }
+        if ignoredChildSessions.count > 512, let any = ignoredChildSessions.first {
+            ignoredChildSessions.remove(any)
         }
     }
 
@@ -222,6 +271,20 @@ public struct LiveAttention: Sendable {
     public mutating func receive(_ event: LiveEvent) -> Bool {
         guard event.valid else { return false }
         let key = SessionKey(source: event.source, sessionID: event.sessionID)
+        if ignoredChildSessions.contains(key) { return false }
+
+        // A single-session terminal CLI (e.g. agy or claude TUI) has one active main conversation at a time.
+        // Any concurrent secondary conversation spawned inside that same active CLI process (such as a forked
+        // swarm worker) is a child worker and is suppressed along with its later completion events.
+        if let host = event.hostProcess, host.singleSessionCLI,
+           !queue.sessions.contains(where: { $0.id == key }),
+           queue.sessions.contains(where: {
+               $0.id != key && $0.hostProcess == host && ($0.state == .working || $0.state == .needsInput)
+           }) {
+            ignoredChildSessions.insert(key)
+            pruneIfNeeded()
+            return false
+        }
 
         if event.action == .started {
             if let existing = queue.sessions.first(where: { $0.id == key }),
@@ -286,7 +349,10 @@ public struct LiveAttention: Sendable {
     }
 
     public mutating func acknowledge(_ key: SessionKey) { queue.acknowledge(key) }
-    public mutating func clear() { queue.clear() }
+    public mutating func clear() {
+        queue.clear()
+        ignoredChildSessions.removeAll()
+    }
     public mutating func clearFinished() { queue.clearFinished() }
     public mutating func clearTerminal() { queue.clearTerminal() }
 }

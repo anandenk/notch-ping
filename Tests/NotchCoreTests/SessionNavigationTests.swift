@@ -101,7 +101,12 @@ import Testing
             .init(pid: 497, startTime: 7, path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
         ]
         #expect(OriginDetector.app(ancestorPaths: ancestors.map(\.path)) == .terminal)
-        #expect(OriginDetector.hostProcess(ancestors: ancestors) == HostProcess(pid: 499, startTime: 9))
+        #expect(OriginDetector.hostProcess(ancestors: ancestors) == HostProcess(pid: 499, startTime: 9, singleSessionCLI: true))
+
+        let desktopAncestors: [OriginDetector.Ancestor] = [
+            .init(pid: 601, startTime: 20, path: "/Applications/Antigravity.app/Contents/MacOS/Antigravity")
+        ]
+        #expect(OriginDetector.hostProcess(ancestors: desktopAncestors) == HostProcess(pid: 601, startTime: 20, singleSessionCLI: false))
     }
 
     @MainActor @Test func deadHostProcessReconcilesActiveSessionWhilePreservingFinished() {

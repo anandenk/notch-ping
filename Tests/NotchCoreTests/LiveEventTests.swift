@@ -26,9 +26,18 @@ private func hook(_ fields: [String: Any], source: Source = .codex) -> LiveEvent
 
 @Test func subagentEnvelopesAndMalformedEventsAreIgnored() {
     #expect(hook(["session_id": "a", "hook_event_name": "Stop", "agent_id": "child"]) == nil)
+    #expect(hook(["session_id": "a", "hook_event_name": "Stop", "parent_thread_id": "root-thread"]) == nil)
+    #expect(hook(["session_id": "a", "hook_event_name": "Stop", "subagent_kind": "worker"]) == nil)
+    #expect(hook(["session_id": "a", "hook_event_name": "Stop", "thread_source": "thread_spawn"]) == nil)
     #expect(hook(["hook_event_name": "Stop"]) == nil)
     #expect(hook(["session_id": "a", "hook_event_name": "SubagentStop"]) == nil)
     #expect(hook(["conversationId": "a", "agentId": "child"], source: .agy) == nil)
+    #expect(hook(["conversationId": "child", "rootConversationId": "root", "hookEventName": "PreInvocation", "cwd": "/tmp/p"], source: .agy) == nil)
+    #expect(hook(["conversationId": "root", "rootConversationId": "root", "hookEventName": "PreInvocation", "lastUserInput": "Hello", "cwd": "/tmp/p"], source: .agy)?.action == .running)
+    #expect(hook(["conversationId": "battle-arm", "isBattleMode": true, "hookEventName": "PreInvocation", "cwd": "/tmp/p"], source: .agy) == nil)
+    // Antigravity swarm workers emit explicit empty lastUserInput on execution hooks
+    #expect(hook(["conversationId": "swarm-w1", "hookEventName": "PreInvocation", "lastUserInput": "", "cwd": "/tmp/p"], source: .agy) == nil)
+    #expect(hook(["conversationId": "swarm-w1", "hookEventName": "Stop", "lastUserInput": "", "terminationReason": "NO_TOOL_CALL", "cwd": "/tmp/p"], source: .agy) == nil)
     #expect(hook(["session_id": "daemon", "hook_event_name": "Stop", "cwd": "/"]) == nil)
 }
 
@@ -269,4 +278,46 @@ private func hook(_ fields: [String: Any], source: Source = .codex) -> LiveEvent
     #expect(RelativeAge.format(since: 1000, now: 1240) == "4m")
     #expect(RelativeAge.format(since: 1000, now: 8200) == "2h")
     #expect(RelativeAge.format(since: 1000, now: 173_800) == "2d")
+}
+
+@Test func singleSessionCLISuppressesConcurrentForkedWorkersWhileAllowingSeparateTabsAndDesktopApps() {
+    var live = LiveAttention()
+    let cliTab1 = HostProcess(pid: 78816, startTime: 100, singleSessionCLI: true)
+    let cliTab2 = HostProcess(pid: 93408, startTime: 200, singleSessionCLI: true)
+    let desktopApp = HostProcess(pid: 12000, startTime: 50, singleSessionCLI: false)
+
+    // Main coordinator starts in CLI tab 1
+    let r1 = live.receive(LiveEvent(source: .agy, sessionID: "main-1", project: "repo",
+                                    action: .running, timestamp: 10, hostProcess: cliTab1))
+    #expect(r1)
+    // Forked swarm worker spawns inside the same active CLI process -> suppressed
+    let r2 = live.receive(LiveEvent(source: .agy, sessionID: "forked-worker-1", project: "repo",
+                                    action: .running, timestamp: 11, hostProcess: cliTab1))
+    #expect(!r2)
+    // Worker's later Stop event is also suppressed
+    let r3 = live.receive(LiveEvent(source: .agy, sessionID: "forked-worker-1", project: "repo",
+                                    action: .finished, timestamp: 15, hostProcess: cliTab1))
+    #expect(!r3)
+
+    // Separate CLI tab (different PID) IS a distinct main agent -> accepted
+    let r4 = live.receive(LiveEvent(source: .agy, sessionID: "main-2", project: "other",
+                                    action: .running, timestamp: 12, hostProcess: cliTab2))
+    #expect(r4)
+
+    // Multi-session desktop app allows multiple concurrent main user tabs
+    let r5 = live.receive(LiveEvent(source: .codex, sessionID: "desk-tab-1", project: "p1",
+                                    action: .running, timestamp: 13, hostProcess: desktopApp))
+    let r6 = live.receive(LiveEvent(source: .codex, sessionID: "desk-tab-2", project: "p2",
+                                    action: .running, timestamp: 14, hostProcess: desktopApp))
+    #expect(r5 && r6)
+
+    #expect(live.queue.sessions.map(\.id.sessionID) == ["main-1", "main-2", "desk-tab-1", "desk-tab-2"])
+
+    // Once CLI tab 1 finishes, starting a /new main conversation in CLI tab 1 IS accepted
+    let r7 = live.receive(LiveEvent(source: .agy, sessionID: "main-1", project: "repo",
+                                    action: .finished, timestamp: 20, hostProcess: cliTab1))
+    let r8 = live.receive(LiveEvent(source: .agy, sessionID: "main-1-new", project: "repo",
+                                    action: .running, timestamp: 25, hostProcess: cliTab1))
+    #expect(r7 && r8)
+    #expect(live.queue.sessions.contains { $0.id.sessionID == "main-1-new" })
 }

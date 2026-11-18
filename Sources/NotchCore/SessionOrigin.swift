@@ -34,10 +34,23 @@ public enum OriginApp: String, Codable, CaseIterable, Sendable {
 public struct HostProcess: Codable, Equatable, Sendable {
     public let pid: Int32
     public let startTime: Int64
+    public let singleSessionCLI: Bool
 
-    public init(pid: Int32, startTime: Int64) {
+    private enum CodingKeys: String, CodingKey {
+        case pid, startTime, singleSessionCLI
+    }
+
+    public init(pid: Int32, startTime: Int64, singleSessionCLI: Bool = false) {
         self.pid = pid
         self.startTime = startTime
+        self.singleSessionCLI = singleSessionCLI
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pid = try container.decode(Int32.self, forKey: .pid)
+        startTime = try container.decode(Int64.self, forKey: .startTime)
+        singleSessionCLI = try container.decodeIfPresent(Bool.self, forKey: .singleSessionCLI) ?? false
     }
 }
 
@@ -83,18 +96,28 @@ public enum OriginDetector {
     /// Identify the direct agent process that invoked the hook (skipping shell wrappers).
     public static func hostProcess(ancestors: [Ancestor]) -> HostProcess? {
         let shells: Set<String> = ["sh", "bash", "zsh", "dash", "env"]
+        let multiSessionHost = ancestors.contains {
+            $0.path.contains("/Antigravity.app/")
+                || $0.path.contains("/Claude.app/")
+                || $0.path.contains("/ChatGPT.app/")
+                || $0.path.contains("/Codex.app/")
+                || $0.path.contains("/app-server-daemon/")
+        }
         for ancestor in ancestors {
             let name = (ancestor.path as NSString).lastPathComponent
             if shells.contains(name) { continue }
-            if ancestor.path.hasSuffix("/agy")
-                || ancestor.path.contains("/claude/")
-                || ancestor.path.hasSuffix("/claude")
+            let isCLI = !multiSessionHost && (
+                ancestor.path.hasSuffix("/agy")
+                    || ancestor.path.contains("/claude/")
+                    || ancestor.path.hasSuffix("/claude")
+            )
+            if isCLI
                 || ancestor.path.hasSuffix("/codex")
                 || ancestor.path.contains("/Antigravity.app/")
                 || ancestor.path.contains("/Claude.app/")
                 || ancestor.path.contains("/ChatGPT.app/")
                 || ancestor.path.contains("/Codex.app/") {
-                return HostProcess(pid: ancestor.pid, startTime: ancestor.startTime)
+                return HostProcess(pid: ancestor.pid, startTime: ancestor.startTime, singleSessionCLI: isCLI)
             }
             break
         }
