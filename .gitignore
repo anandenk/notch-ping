@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+dist/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.xcuserdata
+DerivedData/
+.vscode/
+.idea/
+.env
+.env.*
